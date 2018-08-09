@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -32,18 +33,29 @@ import (
 	utilfs "k8s.io/kubernetes/pkg/util/filesystem"
 )
 
+const (
+	// The interval (seconds) between two error rate calculation
+	eventHandleErrCountingInterval = 10
+	// The eventHandleErrThreshold (number of errors per second)
+	eventHandleErrThreshold = 20
+	// Timeout for waiting stop the watcher
+	maxWaitForStopWatcher = 30
+)
+
 // RegisterCallbackFn is the type of the callback function that handlers will provide
 type RegisterCallbackFn func(pluginName string, endpoint string, versions []string, socketPath string) (chan bool, error)
 
 // Watcher is the plugin watcher
 type Watcher struct {
-	path      string
-	handlers  map[string]RegisterCallbackFn
-	stopCh    chan interface{}
-	fs        utilfs.Filesystem
-	fsWatcher *fsnotify.Watcher
-	wg        sync.WaitGroup
-	mutex     sync.Mutex
+	path                string
+	handlers            map[string]RegisterCallbackFn
+	stopCh              chan interface{}
+	errCh               chan error
+	eventHandleErrCount int64
+	fs                  utilfs.Filesystem
+	fsWatcher           *fsnotify.Watcher
+	wg                  sync.WaitGroup
+	mutex               sync.Mutex
 }
 
 // NewWatcher provides a new watcher
@@ -165,7 +177,7 @@ func (w *Watcher) invokeRegistrationCallbackAtHandler(ctx context.Context, clien
 	return nil
 }
 
-// Handle filesystem notify event.
+// Handle filesystem notify event, only socket file and dir will be processed.
 func (w *Watcher) handleFsNotifyEvent(event fsnotify.Event) error {
 	if event.Op&fsnotify.Create != fsnotify.Create {
 		return nil
@@ -176,65 +188,85 @@ func (w *Watcher) handleFsNotifyEvent(event fsnotify.Event) error {
 		return fmt.Errorf("stat file %s failed: %v", event.Name, err)
 	}
 
-	if !fi.IsDir() {
+	switch mode := fi.Mode(); {
+	case mode&os.ModeSocket != 0:
 		return w.registerPlugin(event.Name)
+	case mode.IsDir():
+		if err := w.traversePluginDir(event.Name); err != nil {
+			return fmt.Errorf("failed to traverse plugin path %s, err: %v", event.Name, err)
+		}
+	default:
+		glog.V(2).Infof("ignoring %s", event.Name)
 	}
-
-	if err := w.traversePluginDir(event.Name); err != nil {
-		return fmt.Errorf("failed to traverse plugin path %s, err: %v", event.Name, err)
-	}
-
 	return nil
 }
 
 // Start watches for the creation of plugin sockets at the path
-func (w *Watcher) Start() error {
+func (w *Watcher) Start() (<-chan error, error) {
 	glog.V(2).Infof("Plugin Watcher Start at %s", w.path)
 	w.stopCh = make(chan interface{})
 
 	// Creating the directory to be watched if it doesn't exist yet,
 	// and walks through the directory to discover the existing plugins.
 	if err := w.init(); err != nil {
-		return err
+		return nil, err
 	}
 
 	fsWatcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		return fmt.Errorf("failed to start plugin fsWatcher, err: %v", err)
+		return nil, fmt.Errorf("failed to start plugin fsWatcher, err: %v", err)
 	}
 	w.fsWatcher = fsWatcher
 
 	if err := w.traversePluginDir(w.path); err != nil {
 		fsWatcher.Close()
-		return fmt.Errorf("failed to traverse plugin socket path, err: %v", err)
+		return nil, fmt.Errorf("failed to traverse plugin socket path, err: %v", err)
 	}
 
+	w.errCh = make(chan error)
 	w.wg.Add(1)
 	go func(fsWatcher *fsnotify.Watcher) {
 		defer w.wg.Done()
 		for {
 			select {
 			case event := <-fsWatcher.Events:
-				//TODO: Handle errors by taking corrective measures
 				go func() {
 					err := w.handleFsNotifyEvent(event)
 					if err != nil {
-						glog.Errorf("error %v when handle event: %s", err, event)
+						atomic.AddInt64(&w.eventHandleErrCount, 1)
+						glog.Errorf("handle event: %s failed, %v", event, err)
 					}
 				}()
 				continue
 			case err := <-fsWatcher.Errors:
-				if err != nil {
-					glog.Errorf("fsWatcher received error: %v", err)
+				if err == fsnotify.ErrEventOverflow {
+					select {
+					case w.errCh <- err:
+					case <-w.stopCh:
+						return
+					}
 				}
+				glog.Errorf("fsWatcher received error: %v", err)
 				continue
 			case <-w.stopCh:
 				fsWatcher.Close()
 				return
+			case <-time.After(eventHandleErrCountingInterval * time.Second):
+				errRate := atomic.LoadInt64(&w.eventHandleErrCount) / eventHandleErrCountingInterval
+				if errRate >= eventHandleErrThreshold {
+					select {
+					case w.errCh <- fmt.Errorf("%d error per second when handling events", errRate):
+					case <-w.stopCh:
+						return
+
+					}
+				}
+				atomic.SwapInt64(&w.eventHandleErrCount, 0)
+				continue
 			}
 		}
 	}(fsWatcher)
-	return nil
+	return w.errCh, nil
 }
 
 // Stop stops probing the creation of plugin sockets at the path
@@ -247,9 +279,10 @@ func (w *Watcher) Stop() error {
 	}()
 	select {
 	case <-c:
-	case <-time.After(10 * time.Second):
+	case <-time.After(maxWaitForStopWatcher * time.Second):
 		return fmt.Errorf("timeout on stopping watcher")
 	}
+	close(w.errCh)
 	return nil
 }
 

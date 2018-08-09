@@ -18,7 +18,9 @@ package pluginwatcher
 
 import (
 	"errors"
+	"fmt"
 	"io/ioutil"
+	"net"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -53,7 +55,9 @@ func TestExamplePlugin(t *testing.T) {
 	h := NewExampleHandler()
 	w.AddHandler(registerapi.DevicePlugin, h.Handler)
 
-	require.NoError(t, w.Start())
+	ch, err := w.Start()
+	require.NoError(t, err)
+	stopCh := subscribeErrorChan(t, ch)
 
 	socketPath := filepath.Join(rootDir, "plugin.sock")
 	PluginName := "example-plugin"
@@ -87,8 +91,11 @@ func TestExamplePlugin(t *testing.T) {
 	// Restarts plugin watcher should traverse the socket directory and issues a
 	// callback for every existing socket.
 	require.NoError(t, w.Stop())
+	close(stopCh)
 	require.NoError(t, h.Cleanup())
-	require.NoError(t, w.Start())
+	ch, err = w.Start()
+	require.NoError(t, err)
+	stopCh = subscribeErrorChan(t, ch)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -121,6 +128,7 @@ func TestExamplePlugin(t *testing.T) {
 	}
 
 	require.NoError(t, w.Stop())
+	close(stopCh)
 	require.NoError(t, w.Cleanup())
 }
 
@@ -143,7 +151,9 @@ func TestPluginWithSubDir(t *testing.T) {
 	dpSocketPath := filepath.Join(rootDir, registerapi.DevicePlugin, "plugin.sock")
 	csiSocketPath := filepath.Join(rootDir, registerapi.CSIPlugin, "plugin.sock")
 
-	require.NoError(t, w.Start())
+	ch, err := w.Start()
+	require.NoError(t, err)
+	stopCh := subscribeErrorChan(t, ch)
 
 	// two plugins using the same name but with different type
 	dp := NewTestExamplePlugin("exampleplugin", registerapi.DevicePlugin, "example-endpoint")
@@ -157,9 +167,12 @@ func TestPluginWithSubDir(t *testing.T) {
 	// Restarts plugin watcher should traverse the socket directory and issues a
 	// callback for every existing socket.
 	require.NoError(t, w.Stop())
+	close(stopCh)
 	require.NoError(t, hcsi.Cleanup())
 	require.NoError(t, hdp.Cleanup())
-	require.NoError(t, w.Start())
+	ch, err = w.Start()
+	require.NoError(t, err)
+	stopCh = subscribeErrorChan(t, ch)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -194,6 +207,71 @@ func TestPluginWithSubDir(t *testing.T) {
 	}
 
 	require.NoError(t, w.Stop())
+	close(stopCh)
+	require.NoError(t, w.Cleanup())
+}
+
+func TestFloodedEvents(t *testing.T) {
+	rootDir, err := ioutil.TempDir("", "plugin_test")
+	require.NoError(t, err)
+
+	w := NewWatcher(rootDir)
+	hdp := NewExampleHandler()
+
+	w.AddHandler(registerapi.DevicePlugin, hdp.Handler)
+
+	err = w.fs.MkdirAll(filepath.Join(rootDir, registerapi.DevicePlugin), 0755)
+	require.NoError(t, err)
+
+	ch, err := w.Start()
+	require.NoError(t, err)
+
+	errReceived := make(chan interface{})
+	stopWait := make(chan interface{})
+	go func() {
+		for {
+			select {
+			case err := <-ch:
+				if err != nil {
+					t.Logf("%v", err)
+					close(errReceived)
+					return
+				}
+			case <-stopWait:
+				return
+			}
+
+		}
+	}()
+
+	// we need to generate lot of events
+	numDirs := 500
+	numRepeat := 10
+	for dn := 0; dn < numDirs; dn++ {
+		err := w.fs.MkdirAll(fmt.Sprintf("%s/%s/%d", rootDir, registerapi.DevicePlugin, dn), 0755)
+		require.NoError(t, err)
+	}
+
+	for dn := 0; dn < numDirs; dn++ {
+		subDir := fmt.Sprintf("%s/%s/%d", rootDir, registerapi.DevicePlugin, dn)
+		go func() {
+			for fn := 0; fn < numRepeat; fn++ {
+				socketPath := fmt.Sprintf("%s/%d", subDir, fn)
+				_, err := net.Listen("unix", socketPath)
+				require.NoError(t, err)
+				w.fs.Remove(socketPath)
+			}
+		}()
+	}
+
+	select {
+	case <-errReceived:
+	case <-time.After(60 * time.Second):
+		close(stopWait)
+		t.Fatal("timeout while waiting for error happened")
+	}
+
+	require.NoError(t, w.Stop())
 	require.NoError(t, w.Cleanup())
 }
 
@@ -205,4 +283,21 @@ func waitForPluginRegistrationStatus(t *testing.T, statusCh chan registerapi.Reg
 		t.Fatalf("Timed out while waiting for registration status")
 	}
 	return false
+}
+
+func subscribeErrorChan(t *testing.T, ch <-chan error) chan interface{} {
+	stopCh := make(chan interface{})
+	go func() {
+		for {
+			select {
+			case err := <-ch:
+				if err != nil {
+					t.Fatalf("non expected major error from watcher %v", err)
+				}
+			case <-stopCh:
+				return
+			}
+		}
+	}()
+	return stopCh
 }
