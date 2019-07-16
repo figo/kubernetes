@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM BASEIMAGE
+FROM kubernetes-docker-local.artifactory.eng.vmware.com/debian-base-amd64:v1.0.0_vmware.2
 
 RUN clean-install \
     conntrack \

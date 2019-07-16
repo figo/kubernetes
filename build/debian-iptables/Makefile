@@ -21,7 +21,7 @@ ARCH?=amd64
 ALL_ARCH = amd64 arm arm64 ppc64le s390x
 TEMP_DIR:=$(shell mktemp -d)
 
-BASEIMAGE?=k8s.gcr.io/debian-base-$(ARCH):v1.0.0
+BASEIMAGE?=kubernetes-docker-local.artifactory.eng.vmware.com/debian-base-$(ARCH):v1.0.0
 
 # This option is for running docker manifest command
 export DOCKER_CLI_EXPERIMENTAL := enabled
@@ -30,7 +30,8 @@ SUDO=$(if $(filter 0,$(shell id -u)),,sudo)
 
 build:
 	cp ./* $(TEMP_DIR)
-	cd $(TEMP_DIR) && sed -i "s|BASEIMAGE|$(BASEIMAGE)|g" Dockerfile
+	cd $(TEMP_DIR)
+	#cd $(TEMP_DIR) && sed -i "s|BASEIMAGE|$(BASEIMAGE)|g" Dockerfile
 
 ifneq ($(ARCH),amd64)
 	# Register /usr/bin/qemu-ARCH-static as the handler for non-x86 binaries in the kernel

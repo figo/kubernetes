@@ -33,7 +33,7 @@ SUDO=$(if $(filter 0,$(shell id -u)),,sudo)
 export DOCKER_CLI_EXPERIMENTAL := enabled
 
 ifeq ($(ARCH),amd64)
-	BASEIMAGE?=debian:stretch
+	BASEIMAGE?=dockerhub.artifactory.eng.vmware.com/library/debian:stretch
 endif
 ifeq ($(ARCH),arm)
 	BASEIMAGE?=arm32v7/debian:stretch
